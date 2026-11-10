@@ -1082,6 +1082,21 @@ export class TurnLifecycle {
           this.#providerRetried(agentId, threadId, getString(params, "turnId"), source.provider);
           return;
         }
+        // Uma cota interrompendo trabalho próprio conserva a entrega até a renovação,
+        // mesmo sem reserva disponível. Saldo insuficiente e canais mantêm sua política.
+        const quotaTurnId = getString(params, "turnId");
+        if (
+          notification.method === "error" &&
+          causeCode === "usage_limit" &&
+          !/\b(?:credits?|balance|billing)\b/iu.test(message) &&
+          agentId &&
+          threadId &&
+          quotaTurnId &&
+          !this.#conversation.isExecutionThread(threadId) &&
+          !this.#hooks.turnStopped(agentId, this.#taskForThread(agentId, threadId), quotaTurnId) &&
+          this.#carriesWork(agentId, quotaTurnId, this.#runningTurns.get(quotaTurnId))
+        )
+          this.#limitedTurns.set(quotaTurnId, this.#limitedTurns.get(quotaTurnId) ?? null);
         // A usage limit shows no banner, but the failed delivery still keeps it as the reason.
         const errorTurnId = getString(params, "turnId");
         if (notification.method === "error" && errorTurnId && this.#runningTurns.has(errorTurnId)) {
@@ -1393,11 +1408,16 @@ export class TurnLifecycle {
                 )?.plan ?? null,
             })
           : null;
-      // After work started, only a ready backup in the agent's order, or the ready model that the agent
-      // left, continues it. A turn refused before work still waits for the reset when no backup is
-      // ready. A continuation that a backup refused before work keeps the earlier provider's work.
+      // Trabalho próprio aguarda a renovação quando nenhuma reserva está disponível.
+      // Canais continuam seguindo a disponibilidade e a reatribuição da sua fila.
+      // A recusa antes de uma nova ação também preserva o trabalho anterior.
       const carriesWork = this.#carriesWork(agentId, turnId, running);
-      let continuing = limited && carriesWork && deliveries.length > 0 && this.#hooks.mayContinueOnBackup(agentId);
+      let continuing =
+        limited &&
+        carriesWork &&
+        deliveries.length > 0 &&
+        !this.#hooks.turnStopped(agentId, laneTaskId, turnId) &&
+        (!channelTurn || this.#hooks.mayContinueOnBackup(agentId));
       if (continuing) {
         for (const { delivery, channelId } of deliveries) {
           if (channelId && !(yield* this.#hooks.requeueChannelDelivery(delivery.id, true))) {
@@ -1406,7 +1426,12 @@ export class TurnLifecycle {
           }
         }
       }
-      const repeatable = limited && running !== undefined && (!running.acted || continuing) && deliveries.length > 0;
+      const repeatable =
+        limited &&
+        running !== undefined &&
+        (!running.acted || continuing) &&
+        deliveries.length > 0 &&
+        !this.#hooks.turnStopped(agentId, laneTaskId, turnId);
       const requeue = repeatable && (!channelTurn || continuing);
       // The limit belongs to the model the turn ran on, which the agent may have left since.
       const model = this.#hooks.turnModel(agentId, turnId);
