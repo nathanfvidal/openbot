@@ -30,6 +30,9 @@ Usage: openbot <command>
                                  account. It works for one sign-in and expires after two minutes.
   logout                         Sign out. The server stops until the next sign-in.
   name <name>                    Change the server name.
+  identity preview|apply|recover <server-id> <fingerprint> <operation-id> <name>
+                                 Separa uma identidade clonada. Faça preview antes de apply.
+                                 recover retoma o mesmo candidato após falha ou reinício.
   logs [-f]                      Show the OpenBot log.
   start | stop | restart         Control the OpenBot service (sudo).
   update                         Install the newest release now (sudo).
@@ -139,6 +142,16 @@ show_status() {
     *) echo "Account: $account" ;;
   esac
   if [ -n "$name" ]; then echo "Server: $name ($server)"; else echo "Server: $server"; fi
+  if [ -n "$(value server_id)" ]; then
+    echo "ID do servidor: $(value server_id)"
+    echo "Impressão digital: $(value server_fingerprint)"
+  fi
+  if [ "$(value identity_publication_blocked)" = 1 ]; then
+    echo "Publicação bloqueada: conclua a separação de identidade pelo controle local."
+    if [ -n "$(value identity_separation_required_from)" ]; then
+      echo "ID original exigido: $(value identity_separation_required_from)"
+    fi
+  fi
   case $server in error | unconfigured) if [ -n "$message" ]; then echo "  $message"; fi ;; esac
   # The limit is the smaller of the machine memory and the limit of the unit or the container.
   limit=$(value memory_limit)
@@ -331,6 +344,14 @@ case $command in
     control POST /v1/name "name=$*"
     check_answer || exit 1
     show_status
+    ;;
+  identity)
+    [ "$#" -eq 5 ] || fail "Uso: openbot identity preview|apply|recover <server-id> <fingerprint> <operation-id> <nome>"
+    action=$1
+    case "$action" in preview|apply|recover) ;; *) fail "Ação de identidade inválida." ;; esac
+    control POST "/v1/identity/$action" "expected_server_id=$2" "expected_fingerprint=$3" "operation_id=$4" "name=$5"
+    check_answer || exit 1
+    printf '%s\n' "$response" | sed '/^status=/d'
     ;;
   mobile-connect) mobile_connect_command ;;
   logs) logs_command "$@" ;;

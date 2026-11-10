@@ -1,6 +1,7 @@
 import { Deferred, Effect, Exit } from "effect";
 
 export class AgentInitializationGate<E> {
+  readonly #suspended: boolean;
   readonly #initialize: (rosterLoaded: Effect.Effect<void>) => Effect.Effect<void, E>;
   #pending: Deferred.Deferred<void, E> | null = null;
   #roster: Deferred.Deferred<void> | null = null;
@@ -11,8 +12,12 @@ export class AgentInitializationGate<E> {
    * provider starts and the routine sweeps, do not change the roster, so the agent list does not
    * wait for them.
    */
-  constructor(initialize: (rosterLoaded: Effect.Effect<void>) => Effect.Effect<void, E>) {
+  constructor(
+    initialize: (rosterLoaded: Effect.Effect<void>) => Effect.Effect<void, E>,
+    options: { suspended: boolean } = { suspended: false },
+  ) {
     this.#initialize = initialize;
+    this.#suspended = options.suspended;
   }
 
   /** Whether the first initialization — including database migrations — is still running. */
@@ -26,6 +31,8 @@ export class AgentInitializationGate<E> {
   }
 
   readonly start = Effect.fn("AgentInitializationGate.start")(function* (this: AgentInitializationGate<E>) {
+    // A separação da identidade não autoriza retomar o trabalho herdado do clone.
+    if (this.#suspended) return;
     if (this.#pending) return yield* Deferred.await(this.#pending);
     const completion = Deferred.makeUnsafe<void, E>();
     const roster = Deferred.makeUnsafe<void>();

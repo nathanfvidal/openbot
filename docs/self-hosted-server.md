@@ -369,3 +369,78 @@ Threat model:
   gets 1280x800, the agent display the display size, and a process without the authority file cannot
   open the agent display. Computer Use and remote desktop on the agent display were not tested on a
   server.
+
+## Separar a identidade de uma instância clonada
+
+Copiar o volume também copia o identificador e as chaves do servidor. Renomear, sair e entrar
+na conta ou rotacionar apenas a chave não separa essa identidade. A operação abaixo é explícita,
+exclusiva do controle local do serviço, com a conta proprietária autenticada. Não altera a conta,
+o SQLite, canais, mensagens, anexos, agentes ou configurações.
+
+Antes de iniciar esta versão pela primeira vez na cópia, configure no ambiente do processo
+OPENBOT_REQUIRE_IDENTITY_SEPARATION=<ID UUID original>. Em Docker, defina a variável no contêiner
+de destino antes de iniciá-lo com a nova imagem; em systemd, use Environment no serviço e recarregue
+a unidade. Esse procedimento não deve reiniciar a versão antiga da cópia, pois ela não conhece
+a proteção. Confira o contêiner e volume antes de qualquer ação.
+
+A variável é vinculada ao ID original, não é um interruptor global. Antes de existir qualquer diário,
+o bootstrap já mantém socket e status disponíveis e bloqueia publicação, configuração automática,
+renomeação, rotação e abertura do acesso antigo. Um valor inválido impede o bootstrap. A variável
+pode permanecer após o sucesso: só um diário concluído para aquela origem e conta, com seu candidato
+ativo, libera a publicação. Trocar por qualquer outro ID ou usar perfil sem o diário mantém o bloqueio.
+O status mostra a origem exigida e se a publicação está bloqueada.
+
+
+Enquanto a variável estiver configurada, a inicialização dos agentes, os provedores, os eventos,
+a sincronização das automações e a recuperação de fluxos, rotinas e resultados permanecem suspensos.
+Essa suspensão continua após apply ou recover concluir a nova identidade e após cada reinício.
+O controle local de status, preview, apply e recover continua disponível; filas, rotinas, conversas
+e arquivos não são removidos. A nova identidade publicada não significa que o trabalho foi retomado.
+
+Para liberar o trabalho, o operador deve primeiro revisar as tarefas e rotinas herdadas da cópia.
+Só depois dessa decisão explícita, remova OPENBOT_REQUIRE_IDENTITY_SEPARATION do ambiente do
+contêiner ou serviço e reinicie esta versão. Reiniciar sem remover a variável mantém a suspensão;
+removê-la antes de concluir a separação desativa também a proteção da identidade original.
+
+Antes de executar, confirme o contêiner e volume de destino. Use openbot status para obter o ID e
+a impressão digital pública da identidade clonada e confira os valores no inventário confiável.
+Gere um identificador de operação
+único, como um UUID. Use exatamente os mesmos quatro valores nas três fases:
+
+```sh
+openbot identity preview '<ID atual>' '<impressão digital atual>' '<UUID da operação>' 'Autus'
+openbot identity apply '<ID atual>' '<impressão digital atual>' '<UUID da operação>' 'Autus'
+# Somente se apply falhar ou o processo cair:
+openbot identity recover '<ID atual>' '<impressão digital atual>' '<UUID da operação>' 'Autus'
+```
+
+A prévia não grava arquivos nem acessa a rede. Ela informa a identidade de origem, o nome solicitado
+e quantas sessões e permissões locais serão encerradas. Os novos ID e chaves são gerados apenas em
+apply, persistidos atomicamente no diário local antes do cadastro e reutilizados em recover.
+Um novo vínculo de proprietário também recebe ID próprio, pois esse ID é global no serviço central.
+
+Após preparar o diário, o serviço fecha o acesso antigo e bloqueia sua publicação, inclusive depois
+de reiniciar. O novo servidor só é ativado após uma resposta central que confirme ID, nome e vínculo
+do proprietário. Falha, resposta perdida ou confirmação incompatível mantém a identidade antiga no
+arquivo e o acesso pausado. Repita recover com os mesmos valores; não faça logout/login para tentar
+contornar a pendência. A repetição após sucesso não gera outra identidade. Uma falha ao iniciar o novo
+runtime também pode ser recuperada dessa forma.
+
+O cadastro original permanece no serviço central. A operação não o remove, renomeia nem registra
+novamente. Cada tentativa de recuperação cadastra somente o novo ID; uma resposta perdida pode
+rotacionar a credencial desse novo ID, sem afetar a origem. A credencial é armazenada pelo gerenciador
+de autenticação existente, nunca devolvida pelo comando ou copiada para o diário.
+
+Sessões, convites e sessões remotas em memória da cópia são revogados na ativação. Apenas o novo
+proprietário fica habilitado, vinculado à conta autenticada e sem herdar senha local da cópia.
+Os membros antigos permanecem como referências locais desabilitadas;
+o antigo proprietário deixa de ter papel de proprietário na cópia. Reconvide explicitamente os
+membros que devem acessar o novo servidor. Os clientes precisam selecionar e parear o novo servidor.
+
+O diário fica em openbot-team-server-v2.json, protegido pelo mesmo arquivo com permissão 0600. Ele
+retém o registro anterior, inclusive suas chaves privadas, para não descartar identidade ou dados
+de autorização existentes. Não exporte, envie ao suporte ou imprima esse arquivo. A retenção é
+indefinida nesta versão; não existe limpeza automática nem retorno suportado para a identidade
+original, pois republicá-la poderia interferir na outra instância. A recuperação suportada conclui
+a mesma separação, preservando os registros antigos apenas localmente. Uma versão anterior que
+reconcilie o arquivo legado não deve ser usada para administrar a cópia separada.

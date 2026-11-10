@@ -2871,6 +2871,9 @@ export async function createApplicationServices({
   // A server on this computer has no account session: the desktop app reads its directory for it.
   const localServerMembers = new LocalServerMembers(() => process.stdout.write(formatLocalServerMembersRequest()));
   const host = new HostService({
+    ...(serverModeEnvironment?.requiredIdentitySeparationFrom
+      ? { requiredIdentitySeparationFrom: serverModeEnvironment.requiredIdentitySeparationFrom }
+      : {}),
     appVersion: app.getVersion(),
     store: teamStore,
     agents: service,
@@ -3784,25 +3787,27 @@ export async function createApplicationServices({
     updaterCacheDirectory,
   });
   teardown.push(TEARDOWN_ORDER.updater, "the update service", () => Effect.runPromise(updater.stop()));
-  const agentInitialization = new AgentInitializationGate((rosterLoaded) =>
-    Effect.gen(function* () {
-      // A client's agent list waits only until the agents are restored, not for the provider starts.
-      // The providers start after the computer-use warm-up: it decides whether the MCP entry is
-      // there, and a session made while it still probes would keep a command that it can stop.
-      yield* service.initialize({
-        heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)),
-        rosterLoaded,
-        beforeProviderStart: Fiber.join(computerUseWarmUp).pipe(Effect.asVoid),
-      });
-      yield* eventsRuntime.start();
-      yield* automation.sync();
-      // Picks up the flows a restart stopped between one agent's answer and the next agent's message.
-      yield* routineFlowRuntime.sweep();
-      // Ends the workflow steps a restart cut off, and moves the runs on.
-      yield* workflowRuntime.sweep();
-      // Marks the posts a restart cut off, and sends the answers that ended while OpenBot was closed.
-      yield* routineResultRuntime.recover();
-    }),
+  const agentInitialization = new AgentInitializationGate(
+    (rosterLoaded) =>
+      Effect.gen(function* () {
+        // A client's agent list waits only until the agents are restored, not for the provider starts.
+        // The providers start after the computer-use warm-up: it decides whether the MCP entry is
+        // there, and a session made while it still probes would keep a command that it can stop.
+        yield* service.initialize({
+          heldRoutines: takeRoutineHold(routineHoldFile, (message) => logger.warn(message)),
+          rosterLoaded,
+          beforeProviderStart: Fiber.join(computerUseWarmUp).pipe(Effect.asVoid),
+        });
+        yield* eventsRuntime.start();
+        yield* automation.sync();
+        // Picks up the flows a restart stopped between one agent's answer and the next agent's message.
+        yield* routineFlowRuntime.sweep();
+        // Ends the workflow steps a restart cut off, and moves the runs on.
+        yield* workflowRuntime.sweep();
+        // Marks the posts a restart cut off, and sends the answers that ended while OpenBot was closed.
+        yield* routineResultRuntime.recover();
+      }),
+    { suspended: Boolean(serverModeEnvironment?.requiredIdentitySeparationFrom) },
   );
   const describeRestartReadiness = (): RestartReadiness =>
     checkRestartReadiness({

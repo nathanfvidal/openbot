@@ -24,7 +24,7 @@ import { parseHostedServerName } from "@openbot/contracts/hosted-servers";
 import { INPUT_LIMITS } from "@openbot/contracts/input-limits";
 import type { CentralAuthState } from "@openbot/contracts/ipc";
 import { sourceText } from "@openbot/i18n/source";
-import { Deferred, Effect } from "effect";
+import { Deferred, Effect, Result } from "effect";
 import QRCode from "qrcode";
 import { runCauseEffect } from "../backend/effect-boundary";
 import type { CentralAuthManager } from "./central-auth-manager";
@@ -42,6 +42,17 @@ const DEFAULT_SERVER_NAME = "OpenBot";
 
 export interface ServerModeEnvironment {
   controlSocketPath: string;
+  /** ID original que esta cópia deve separar antes de qualquer publicação. */
+  requiredIdentitySeparationFrom?: string;
+}
+
+/** Valor inválido bloqueia o bootstrap, em vez de desativar silenciosamente a proteção. */
+export function parseRequiredIdentitySeparation(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const serverId = value.trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(serverId))
+    throw new Error("OPENBOT_REQUIRE_IDENTITY_SEPARATION deve conter o ID UUID original válido, em minúsculas.");
+  return serverId;
 }
 
 /** Returns null unless this process is a self-hosted server that systemd started. */
@@ -50,12 +61,29 @@ export function takeServerModeEnvironment(
   isPackaged: boolean,
   platform: NodeJS.Platform,
 ): ServerModeEnvironment | null {
-  if (!isPackaged || platform !== "linux" || environment.OPENBOT_SERVER !== "1") return null;
-  // A hosted server signs in with its claim, not from a terminal.
-  if (environment.OPENBOT_HOSTED_SERVER === "1") return null;
+  const requiredIdentitySeparationFrom = parseRequiredIdentitySeparation(
+    environment.OPENBOT_REQUIRE_IDENTITY_SEPARATION,
+  );
+  const selfHosted =
+    isPackaged &&
+    platform === "linux" &&
+    environment.OPENBOT_SERVER === "1" &&
+    environment.OPENBOT_HOSTED_SERVER !== "1";
+  if (!selfHosted) {
+    if (requiredIdentitySeparationFrom)
+      throw new Error("A proteção de identidade exige o modo servidor próprio com controle local.");
+    return null;
+  }
   const runtimeDirectory = environment.XDG_RUNTIME_DIR?.trim() ?? "";
-  if (!isAbsolute(runtimeDirectory)) return null;
-  return { controlSocketPath: join(runtimeDirectory, CONTROL_SOCKET_FILE) };
+  if (!isAbsolute(runtimeDirectory)) {
+    if (requiredIdentitySeparationFrom)
+      throw new Error("A proteção de identidade exige XDG_RUNTIME_DIR absoluto para o controle local.");
+    return null;
+  }
+  return {
+    controlSocketPath: join(runtimeDirectory, CONTROL_SOCKET_FILE),
+    ...(requiredIdentitySeparationFrom ? { requiredIdentitySeparationFrom } : {}),
+  };
 }
 
 export interface ServerModeOptions {
@@ -72,7 +100,13 @@ export interface ServerModeOptions {
     | "logout"
     | "createMobileConnect"
   >;
-  host: Pick<HostService, "getStatus" | "configure" | "start" | "updateIdentity" | "getMobileConnectHost">;
+  host: Pick<HostService, "getStatus" | "configure" | "start" | "updateIdentity" | "getMobileConnectHost"> &
+    Partial<
+      Pick<
+        HostService,
+        "previewClonedIdentity" | "applyClonedIdentity" | "recoverClonedIdentity" | "getIdentitySeparationStatus"
+      >
+    >;
   /** The memory guard, so that `status` shows the memory ceiling and the turn limit. */
   memory: Pick<ServerMemory, "level" | "sample" | "turnLimit"> | null;
   onError: (message: string, error: unknown) => void;
@@ -165,6 +199,11 @@ export class ServerMode {
         this.#publishError = null;
         if (this.#options.centralAuth.getState().status !== "signed_in") return;
         const { host } = this.#options;
+        const separation = host.getIdentitySeparationStatus?.();
+        if (separation?.blocked || (this.#options.environment.requiredIdentitySeparationFrom && !separation))
+          return yield* new RemoteWorkflowError({
+            cause: new Error("Publicação bloqueada até concluir a separação da identidade pelo controle local."),
+          });
         const serverName = this.#pendingName;
         // Only the owner supplies a name; it also renames the account's existing host.
         if (!host.getStatus().configured) yield* host.configure({ serverName: serverName ?? DEFAULT_SERVER_NAME });
@@ -215,6 +254,10 @@ export class ServerMode {
         return runCauseEffect(this.#verifyLogin(body.get("challenge") ?? "", body.get("code") ?? "", body.get("name")));
       case "POST /v1/login/claim":
         return runCauseEffect(this.#claimLogin(body.get("claim") ?? "", body.get("name")));
+      case "POST /v1/identity/preview":
+      case "POST /v1/identity/apply":
+      case "POST /v1/identity/recover":
+        return runCauseEffect(this.#separateIdentity(path, body));
       case "POST /v1/name":
         return runCauseEffect(this.#rename(body.get("name") ?? ""));
       case "POST /v1/mobile-connect":
@@ -232,6 +275,8 @@ export class ServerMode {
   #status(): Answer {
     const account = this.#options.centralAuth.getState();
     const host = this.#options.host.getStatus();
+    const identity = this.#options.host.getMobileConnectHost();
+    const separation = this.#options.host.getIdentitySeparationStatus?.();
     return {
       status: 200,
       lines: {
@@ -241,6 +286,12 @@ export class ServerMode {
         account_message: account.status === "error" ? account.issue.message : null,
         server: host.phase,
         server_name: host.serverName ?? this.#pendingName,
+        server_id: identity?.hostId ?? null,
+        server_fingerprint: identity?.fingerprint ?? null,
+        identity_separation_required_from:
+          separation?.requiredServerId ?? this.#options.environment.requiredIdentitySeparationFrom ?? null,
+        identity_publication_blocked:
+          (separation?.blocked ?? Boolean(this.#options.environment.requiredIdentitySeparationFrom)) ? 1 : 0,
         server_message: this.#publishError ?? host.message,
         ...this.#memoryLines(),
       },
@@ -350,6 +401,50 @@ export class ServerMode {
     const ticket = yield* createHostedMobileConnect(this.#options).pipe(toRemoteWorkflowError);
     const qr = yield* remoteCall(() => QRCode.toString(ticket.qrData, { type: "terminal", small: true }));
     return { status: 200, lines: { qr: Buffer.from(qr).toString("base64"), expires_at: ticket.expiresAt } };
+  });
+
+  /** Exclusiva do socket privado; não integra o protocolo remoto lançado. */
+  readonly #separateIdentity = Effect.fn("ServerMode.separateIdentity")(function* (
+    this: ServerMode,
+    path: string,
+    body: URLSearchParams,
+  ): Effect.fn.Return<Answer, RemoteWorkflowError> {
+    const account = this.#options.centralAuth.getState();
+    if (account.status !== "signed_in") return issueFailure(account);
+    const method = path.endsWith("/preview")
+      ? this.#options.host.previewClonedIdentity
+      : path.endsWith("/recover")
+        ? this.#options.host.recoverClonedIdentity
+        : this.#options.host.applyClonedIdentity;
+    if (!method) return failure(409, "identity_separation_unavailable");
+    const operation = method({
+      expectedServerId: body.get("expected_server_id") ?? "",
+      expectedFingerprint: body.get("expected_fingerprint") ?? "",
+      serverName: body.get("name") ?? "",
+      operationId: body.get("operation_id") ?? "",
+    });
+    const result = yield* operation.pipe(Effect.result);
+    // Falhas de transporte podem conter credenciais. Esta rota só devolve diagnóstico fixo.
+    if (Result.isFailure(result))
+      return failure(
+        409,
+        "identity_separation_failed",
+        "Separação não concluída. Confira a conta, a identidade esperada e recupere a operação pelo mesmo identificador. O diário pendente bloqueia a publicação antiga.",
+      );
+    const preview = result.success;
+    return {
+      status: 200,
+      lines: {
+        phase: preview.phase,
+        operation_id: preview.operationId,
+        previous_server_id: preview.previousServerId,
+        server_name: preview.serverName,
+        new_server_id: preview.newServerId,
+        new_fingerprint: preview.newFingerprint,
+        sessions_to_revoke: preview.sessionsToRevoke,
+        members_to_disable: preview.membersToDisable,
+      },
+    };
   });
 
   readonly #rename = Effect.fn("ServerMode.rename")(function* (

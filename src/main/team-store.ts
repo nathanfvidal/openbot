@@ -155,6 +155,35 @@ interface StoredTeamFile {
    * a merged host needs no copy - the merge is what keeps both sides.
    */
   replacedHosts?: StoredTeam[];
+  /** Diário local protegido pelo mesmo arquivo 0600; nunca enviado ao serviço central. */
+  identitySeparations?: StoredIdentitySeparation[];
+}
+
+export interface ClonedIdentityInput {
+  expectedServerId: string;
+  expectedFingerprint: string;
+  serverName: string;
+  operationId: string;
+}
+
+export interface ClonedIdentityPreview {
+  phase: "preview" | "pending" | "completed";
+  operationId: string;
+  previousServerId: string;
+  serverName: string;
+  newServerId: string | null;
+  newFingerprint: string | null;
+  sessionsToRevoke: number;
+  membersToDisable: number;
+}
+
+interface StoredIdentitySeparation {
+  operationId: string;
+  accountId: string;
+  expectedFingerprint: string;
+  phase: "pending" | "completed";
+  previous: StoredTeam;
+  candidate: StoredTeam;
 }
 
 export interface TeamIdentity {
@@ -285,7 +314,13 @@ export class TeamStore {
         const baseline = this.#file.legacyImport?.record;
         const index = this.#file.hosts.findIndex((host) => host.serverId === legacy.record.serverId);
         const mine = index < 0 ? undefined : this.#file.hosts[index];
-        if (mine && baseline && baseline.serverId === legacy.record.serverId) {
+        if (
+          this.#file.identitySeparations?.some(
+            (entry) => entry.phase === "completed" && entry.previous.serverId === legacy.record.serverId,
+          )
+        ) {
+          this.#file.replacedHosts = [legacy.record];
+        } else if (mine && baseline && baseline.serverId === legacy.record.serverId) {
           this.#file.hosts[index] = reconcileHost(baseline, mine, legacy.record);
         } else if (mine) {
           // No baseline to reconcile against - an upgrade that never recorded one. Keeping
@@ -436,6 +471,196 @@ export class TeamStore {
   getIdentity(): TeamIdentity | null {
     return this.#state ? identityOf(this.#state) : null;
   }
+
+  /** A prévia não gera chaves, não grava arquivo e não chama a rede. */
+  previewClonedIdentity(user: CentralAuthUser, input: ClonedIdentityInput): ClonedIdentityPreview {
+    this.assertOwnerAccount(user);
+    validateServerName(input.serverName);
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(input.operationId))
+      throw new TeamStoreError("Identificador de operação inválido.");
+    const state = this.#requireState();
+    const existing = this.#file.identitySeparations?.find((entry) => entry.operationId === input.operationId);
+    if (existing) {
+      if (
+        existing.accountId !== user.id ||
+        existing.previous.serverId !== input.expectedServerId ||
+        existing.expectedFingerprint !== input.expectedFingerprint ||
+        existing.candidate.serverName !== input.serverName.trim() ||
+        state.serverId !== (existing.phase === "completed" ? existing.candidate.serverId : existing.previous.serverId)
+      )
+        throw new TeamStoreError("A operação não corresponde à identidade esperada.");
+    } else if (
+      state.serverId !== input.expectedServerId ||
+      fingerprint(state.publicKey) !== input.expectedFingerprint
+    ) {
+      throw new TeamStoreError("A identidade ativa não corresponde à identidade esperada.");
+    }
+    if (state.pendingKeyRotation)
+      throw new TeamStoreError("Conclua a rotação de chave pendente antes de separar a identidade.");
+    if (
+      this.#file.identitySeparations?.some(
+        (entry) => entry.accountId === user.id && entry.phase === "pending" && entry !== existing,
+      )
+    )
+      throw new TeamStoreError("Existe outra separação pendente para esta conta.");
+    return {
+      phase: existing?.phase ?? "preview",
+      operationId: input.operationId,
+      previousServerId: input.expectedServerId,
+      serverName: input.serverName.trim(),
+      newServerId: existing?.candidate.serverId ?? null,
+      newFingerprint: existing ? fingerprint(existing.candidate.publicKey) : null,
+      sessionsToRevoke: existing?.phase === "completed" ? 0 : state.sessions.length + this.#remoteSessions.size,
+      membersToDisable: existing?.phase === "completed" ? 0 : state.members.filter((member) => !member.disabled).length,
+    };
+  }
+
+  /** Um ID diferente sem diário concluído não comprova que esta cópia foi separada. */
+  isClonedIdentitySeparationCompletedFrom(expectedServerId: string): boolean {
+    const state = this.#state;
+    const accountId = this.#file.activeAccountId;
+    if (!state || !accountId || ownerAccountId(state) !== accountId) return false;
+    return (
+      this.#file.identitySeparations?.some(
+        (entry) =>
+          entry.phase === "completed" &&
+          entry.accountId === accountId &&
+          entry.previous.serverId === expectedServerId &&
+          entry.candidate.serverId !== expectedServerId &&
+          entry.candidate.serverId === state.serverId,
+      ) ?? false
+    );
+  }
+
+  hasPendingClonedIdentity(): boolean {
+    return (
+      this.#file.identitySeparations?.some(
+        (entry) => entry.phase === "pending" && entry.previous.serverId === this.#state?.serverId,
+      ) ?? false
+    );
+  }
+
+  /** O candidato é persistido antes de qualquer cadastro remoto e reutilizado na recuperação. */
+  readonly prepareClonedIdentity = Effect.fn("TeamStore.prepareClonedIdentity")(
+    function* (
+      this: TeamStore,
+      user: CentralAuthUser,
+      input: ClonedIdentityInput,
+    ): Effect.fn.Return<
+      ClonedIdentityPreview & { publicKey: string; ownerMembershipId: string },
+      RemoteWorkflowError,
+      TeamStoreFiles
+    > {
+      const preview = yield* remoteDecode(() => this.previewClonedIdentity(user, input));
+      let entry = this.#file.identitySeparations?.find((item) => item.operationId === input.operationId);
+      if (!entry) {
+        const previous = yield* remoteDecode(() => structuredClone(this.#requireState()));
+        const keys = yield* remoteDecode(() =>
+          generateKeyPairSync("ed25519", {
+            publicKeyEncoding: { type: "spki", format: "pem" },
+            privateKeyEncoding: { type: "pkcs8", format: "pem" },
+          }),
+        );
+        const owner = previous.members.find((member) => member.role === "owner");
+        if (!owner) return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Proprietário ausente.") });
+        const newOwner: StoredMember = { ...owner, id: randomUUID(), accountId: user.id, disabled: false };
+        delete newOwner.passwordSalt;
+        delete newOwner.passwordHash;
+        const candidate: StoredTeam = {
+          ...previous,
+          serverId: randomUUID(),
+          serverName: preview.serverName,
+          ...keys,
+          members: [newOwner],
+          sessions: [],
+          invites: [],
+        };
+        delete candidate.pendingKeyRotation;
+        entry = {
+          operationId: input.operationId,
+          accountId: user.id,
+          expectedFingerprint: input.expectedFingerprint,
+          phase: "pending",
+          previous,
+          candidate,
+        };
+        this.#file.identitySeparations ??= [];
+        this.#file.identitySeparations.push(entry);
+        const result = yield* this.#persistFileEffect().pipe(Effect.result);
+        if (Result.isFailure(result)) {
+          this.#file.identitySeparations = this.#file.identitySeparations.filter((item) => item !== entry);
+          return yield* result.failure;
+        }
+      }
+      yield* remoteDecode(() => this.previewClonedIdentity(user, input));
+      const owner = entry.candidate.members.find((member) => member.role === "owner");
+      if (!owner)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Proprietário do candidato ausente.") });
+      return {
+        ...this.previewClonedIdentity(user, input),
+        publicKey: entry.candidate.publicKey,
+        ownerMembershipId: owner.id,
+      };
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
+
+  /** Somente o coordenador chama após confirmar o cadastro central e fechar o runtime antigo. */
+  readonly completeClonedIdentity = Effect.fn("TeamStore.completeClonedIdentity")(
+    function* (
+      this: TeamStore,
+      user: CentralAuthUser,
+      input: ClonedIdentityInput,
+    ): Effect.fn.Return<ClonedIdentityPreview, RemoteWorkflowError, TeamStoreFiles> {
+      const preview = yield* remoteDecode(() => this.previewClonedIdentity(user, input));
+      if (preview.phase === "completed") return preview;
+      const entry = this.#file.identitySeparations?.find((item) => item.operationId === input.operationId);
+      if (!entry)
+        return yield* new RemoteWorkflowError({ cause: new TeamStoreError("Separação ainda não preparada.") });
+      const previous = this.#requireState();
+      const archived = entry.previous;
+      const candidate = entry.candidate;
+      // IDs antigos continuam presentes para referências locais, sem conceder acesso ao novo host.
+      const activated: StoredTeam = {
+        ...previous,
+        serverId: candidate.serverId,
+        serverName: candidate.serverName,
+        publicKey: candidate.publicKey,
+        privateKey: candidate.privateKey,
+        members: [
+          ...candidate.members,
+          ...previous.members.map((member) => ({
+            ...member,
+            role: member.role === "owner" ? ("admin" as const) : member.role,
+            disabled: true,
+          })),
+        ],
+        sessions: [],
+        invites: [],
+      };
+      delete activated.pendingKeyRotation;
+      const index = this.#file.hosts.indexOf(previous);
+      entry.previous = structuredClone(previous);
+      entry.candidate = activated;
+      entry.phase = "completed";
+      this.#file.hosts[index] = activated;
+      this.#state = activated;
+      const result = yield* this.#persistFileEffect().pipe(Effect.result);
+      if (Result.isFailure(result)) {
+        entry.previous = archived;
+        entry.candidate = candidate;
+        entry.phase = "pending";
+        this.#file.hosts[index] = previous;
+        if (this.#state === activated) this.#state = previous;
+        return yield* result.failure;
+      }
+      this.#remoteSessions.clear();
+      return yield* remoteDecode(() => this.previewClonedIdentity(user, input));
+    },
+    Effect.provide(TeamStoreFiles.layer),
+    Effect.uninterruptible,
+  ).bind(this);
 
   getOwnerEmail(): string | null {
     return this.#state?.members.find((member) => member.role === "owner")?.email ?? null;
@@ -723,6 +948,10 @@ export class TeamStore {
    */
   readonly beginKeyRotation = Effect.fn("TeamStore.beginKeyRotation")(
     function* (this: TeamStore): Effect.fn.Return<HostKeyHandover, RemoteWorkflowError, TeamStoreFiles> {
+      if (this.hasPendingClonedIdentity())
+        return yield* new RemoteWorkflowError({
+          cause: new TeamStoreError("Recupere a separação pendente antes de alterar a chave."),
+        });
       const state = yield* remoteDecode(() => this.#requireState());
       if (state.pendingKeyRotation) return state.pendingKeyRotation.handover;
       const { publicKey, privateKey } = yield* remoteDecode(() =>
@@ -1856,6 +2085,18 @@ function isStoredTeamFile(value: unknown): value is StoredTeamFile {
     (value.activeAccountId === null || isString(value.activeAccountId)) &&
     Array.isArray(value.hosts) &&
     value.hosts.every((host) => isStoredTeam(host)) &&
+    (value.identitySeparations === undefined ||
+      (Array.isArray(value.identitySeparations) &&
+        value.identitySeparations.every(
+          (entry) =>
+            isDynamicRecord(entry) &&
+            isString(entry.operationId) &&
+            isString(entry.accountId) &&
+            isString(entry.expectedFingerprint) &&
+            (entry.phase === "pending" || entry.phase === "completed") &&
+            isStoredTeam(entry.previous) &&
+            isStoredTeam(entry.candidate),
+        ))) &&
     (value.legacyImport === undefined ||
       (isDynamicRecord(value.legacyImport) &&
         isString(value.legacyImport.fingerprint) &&

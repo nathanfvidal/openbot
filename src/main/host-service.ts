@@ -61,6 +61,7 @@ import type { AgentAccessStore } from "./agent-access-store";
 import { type AgentNotificationLevelStore, OWNER_NOTIFICATION_KEY } from "./agent-notification-level-store";
 import { BrowserViewGateway } from "./browser-view-gateway";
 import type { RemoteHostTicketHome, VerifiedRemoteSessionTicket } from "./central-auth-manager";
+import { ClonedHostIdentityService } from "./cloned-host-identity";
 import { LiveActivityPushService, LiveActivitySendFailure } from "./live-activity-push";
 import type { PushNotificationStore } from "./push-notification-store";
 import {
@@ -82,7 +83,7 @@ import { memberAuditChanges, memberAuditName, type ServerAuditStore } from "./se
 import { OWNER_PIN_KEY, type SidebarPinStore } from "./sidebar-pin-store";
 import type { TeamApiAgentNotificationLevels, TeamApiSidebarPins } from "./team-api/dependencies";
 import { TeamApiServer } from "./team-api-server";
-import type { RemoteDirectoryMember, TeamIdentity, TeamStore } from "./team-store";
+import type { ClonedIdentityInput, RemoteDirectoryMember, TeamIdentity, TeamStore } from "./team-store";
 import type { TeamWebRtcBridge } from "./team-webrtc-bridge";
 import { TeamWebRtcHostGateway } from "./team-webrtc-host-gateway";
 
@@ -157,6 +158,8 @@ interface HostServiceOptions {
   focusUse?: ForwardedApiOptions["focusUse"];
   appVersion: string;
   store: TeamStore;
+  /** Bootstrap de uma cópia: só publica após separar este ID original com diário concluído. */
+  requiredIdentitySeparationFrom?: string;
   agents: ForwardedApiOptions["agents"] &
     Pick<AgentService, "adoptConversationReads" | "branchTask" | "listTaskReads" | "markTaskRead" | "readTask">;
   agentsReady: NonNullable<ForwardedApiOptions["agentsReady"]>;
@@ -314,6 +317,7 @@ export class HostService extends EventEmitter<HostEvents> {
   readonly #pushNotifications: PushNotificationService | undefined;
   #status: HostStatus;
   #runtimeGeneration = 0;
+  #clonedIdentityService: ClonedHostIdentityService | null = null;
   #startOperation: Fiber.Fiber<HostStatus, RemoteWorkflowError> | null = null;
   /** A registration and a key rotation each read the host key, so only one of them runs at a time. */
   readonly #hostKeyLock = Semaphore.makeUnsafe(1);
@@ -615,6 +619,21 @@ export class HostService extends EventEmitter<HostEvents> {
     if (this.#webrtcGateway) yield* this.#webrtcGateway.applyNetworkRoute();
   }).bind(this);
 
+  getIdentitySeparationStatus(): { requiredServerId: string | null; blocked: boolean } {
+    const requiredServerId = this.#options.requiredIdentitySeparationFrom ?? null;
+    return {
+      requiredServerId,
+      blocked:
+        this.#options.store.hasPendingClonedIdentity() ||
+        (requiredServerId !== null && !this.#options.store.isClonedIdentitySeparationCompletedFrom(requiredServerId)),
+    };
+  }
+
+  #assertIdentityPublicationAllowed(): void {
+    if (this.getIdentitySeparationStatus().blocked)
+      throw new Error("Publicação bloqueada até concluir a separação da identidade pelo controle local.");
+  }
+
   getStatus(): HostStatus {
     const capabilities = this.#remoteScreen.capabilities();
     return {
@@ -879,6 +898,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   readonly configure = Effect.fn("HostService.configure")(
     function* (this: HostService, input: ConfigureHostInput): Effect.fn.Return<HostStatus, RemoteWorkflowError> {
+      yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
       const optionalRegisterRemoteHost = this.#options.registerRemoteHost;
       const optionalUpdateRemoteHostLogo = this.#options.updateRemoteHostLogo;
       const account = yield* remoteDecode(() => this.#options.getSignedInUser());
@@ -943,6 +963,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   readonly updateIdentity = Effect.fn("HostService.updateIdentity")(
     function* (this: HostService, input: UpdateHostIdentityInput): Effect.fn.Return<HostStatus, RemoteWorkflowError> {
+      yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
       const optionalRegisterRemoteHost = this.#options.registerRemoteHost;
       const optionalUpdateRemoteHostLogo = this.#options.updateRemoteHostLogo;
       // A server on this computer has no account session (#5092). Only the desktop app knows its
@@ -970,8 +991,37 @@ export class HostService extends EventEmitter<HostEvents> {
       }
       return this.getStatus();
     },
-    (operation) => this.#provide(operation),
+    (operation) => this.#localPublish.withPermit(this.#provide(operation)),
   ).bind(this);
+
+  #clonedIdentity(): ClonedHostIdentityService {
+    if (!this.#clonedIdentityService) {
+      const register = this.#options.registerRemoteHost;
+      this.#clonedIdentityService = new ClonedHostIdentityService({
+        store: this.#options.store,
+        getSignedInUser: this.#options.getSignedInUser,
+        registerRemoteHost: (input) =>
+          register
+            ? register(input)
+            : Effect.fail(new RemoteWorkflowError({ cause: new Error("Cadastro central indisponível.") })),
+        prepareIdentity: (user, input) =>
+          this.#localPublish.withPermit(
+            this.#hostKeyLock.withPermit(this.#options.store.prepareClonedIdentity(user, input)),
+          ),
+        pauseHost: () => this.stop(false).pipe(Effect.asVoid),
+        identityActivated: () =>
+          Effect.gen({ self: this }, function* () {
+            this.#publishActiveHost(this.#status.serverId);
+            yield* this.start();
+          }),
+      });
+    }
+    return this.#clonedIdentityService;
+  }
+
+  readonly previewClonedIdentity = (input: ClonedIdentityInput) => this.#clonedIdentity().preview(input);
+  readonly applyClonedIdentity = (input: ClonedIdentityInput) => this.#clonedIdentity().apply(input);
+  readonly recoverClonedIdentity = (input: ClonedIdentityInput) => this.#clonedIdentity().recover(input);
 
   /**
    * Changes the host's key without a new pairing. The current and the new key both sign a
@@ -998,6 +1048,7 @@ export class HostService extends EventEmitter<HostEvents> {
   readonly #rotateKey = Effect.fn("HostService.rotateKey")(function* (
     this: HostService,
   ): Effect.fn.Return<string, RemoteWorkflowError> {
+    yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
     if (!this.#options.handOverRemoteHostKey || !this.#options.registerRemoteHost)
       return yield* new RemoteWorkflowError({ cause: new Error(sourceText("error.host.keyRotationUnavailable")) });
     yield* remoteDecode(() => this.#options.store.assertOwnerAccount(this.#options.getSignedInUser()));
@@ -1042,6 +1093,7 @@ export class HostService extends EventEmitter<HostEvents> {
       ownerMembershipId: string,
       automatic = false,
     ): Effect.fn.Return<void, RemoteWorkflowError> {
+      yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
       yield* this.#resolvePendingKeyRotation();
       const identity = this.#options.store.getIdentity();
       if (!identity) return;
@@ -1082,6 +1134,7 @@ export class HostService extends EventEmitter<HostEvents> {
 
   /** `automatic` is a publish with no user action: at launch, after sign-in, or a retry after a failure. */
   readonly start = Effect.fn("HostService.start")(function* (this: HostService, automatic = false) {
+    yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
     if (this.#startOperation) {
       const joined = yield* Fiber.join(this.#startOperation);
       // A publish by the user that joins an automatic start does not take its removal refusal (#5273).
@@ -1223,6 +1276,7 @@ export class HostService extends EventEmitter<HostEvents> {
   /** Starts the Team API on loopback only, with no Signal: the development host and a local server. */
   readonly startLoopbackOnly = Effect.fn("HostService.startLoopbackOnly")(
     function* (this: HostService): Effect.fn.Return<HostStatus, RemoteWorkflowError, HostApiRuntime> {
+      yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
       if (!this.#options.store.configured)
         return yield* new RemoteWorkflowError({
           cause: new Error("Name this OpenBot before starting local development."),
@@ -1237,7 +1291,7 @@ export class HostService extends EventEmitter<HostEvents> {
       });
       return this.getStatus();
     },
-    (operation) => this.#provide(operation),
+    (operation) => this.#localPublish.withPermit(this.#provide(operation)),
   ).bind(this);
 
   /**
@@ -1248,6 +1302,7 @@ export class HostService extends EventEmitter<HostEvents> {
    */
   readonly publishLocalServer = Effect.fn("HostService.publishLocalServer")(
     function* (this: HostService): Effect.fn.Return<void, RemoteWorkflowError> {
+      yield* remoteDecode(() => this.#assertIdentityPublicationAllowed());
       const gateway = this.#webrtcGateway;
       const issueTicket = this.#options.issueRemoteHostTicket;
       const identity = this.#options.store.getIdentity();
